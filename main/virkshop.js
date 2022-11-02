@@ -1265,7 +1265,7 @@ export const parsePackageTools = async (pathToPackageTools)=>{
 // fornixToNix
 // 
 export const fornixToNix = async function(yamlString) {
-    // TODO: add support for overwriting values (saveAs: python, then saveAs: python without breaking)
+    // TODO: add error for trying to assign to a keyword (like "builtins", "rec", "let", etc)
     const start = (new Date()).getTime()
     const dataStructure = yaml.parse(yamlString, {schema: yaml.DEFAULT_SCHEMA,},)
     const allSaveAsValues = dataStructure.map(each=>each[Object.keys(each)[0]].saveAs)
@@ -1570,16 +1570,18 @@ export const fornixToNix = async function(yamlString) {
                 ([eachVarName, eachNixString])=>
                     `            ${eachVarName} = ${indent({ string: eachNixString, by: "            ", noLead: true })};`
             ).join("\n")}
-            \n${indent({ string: nixVarsAtThisPoint(), by: "                ", noLead: true })}
+            #
+            # var names that were assigned more than once
+            #${indent({ string: nixVarsAtThisPoint(), by: "            ", noLead: true })}
             #
             # nix shell data
             #
                 _-_nixShellEscapedJsonData = (
                     let 
                         nixShellDataJson = (_-_core.toJSON {
-                            libraryPaths = {\n${indent({string:libraryPathsString, by: "                            ",})}
+                            libraryPaths = {\n${indent({string:libraryPathsString, by: "                                ",})}
                             };
-                            packagePaths = {\n${indent({string:packagePathStrings, by: "                            ",})}
+                            packagePaths = {\n${indent({string:packagePathStrings, by: "                                ",})}
                             };
                         });
                         bashEscapedJson = (builtins.replaceStrings
@@ -1598,13 +1600,13 @@ export const fornixToNix = async function(yamlString) {
             _-_core.mkShell {
                 # inside that shell, make sure to use these packages
                 buildInputs =  [\n${indent({
-                        string:buildInputStrings.join("\n"),
+                        string: [...new Set(buildInputStrings)].join("\n"),
                         by: "                    ",
                     })}
                 ];
                 
                 nativeBuildInputs = [\n${indent({
-                        string: nativeBuildInputStrings.join("\n"),
+                        string: [...new Set(nativeBuildInputStrings)].join("\n"),
                         by: "                    ",
                     })}
                 ];
