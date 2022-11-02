@@ -1247,6 +1247,12 @@ export const shellApi = Object.defineProperties(
         }
     }
 
+export const parsePackageTools = (pathToPackageTools)=>{
+    // in the future their may be some extra logic here
+    const dataStructure = yaml.parse(await FileSystem.read(pathToPackageTools), {schema: yaml.DEFAULT_SCHEMA,},)
+    return dataStructure
+}
+
 // 
 // fornixToNix
 // 
