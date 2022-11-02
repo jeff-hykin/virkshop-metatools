@@ -908,7 +908,7 @@ export const shellApi = Object.defineProperties(
         createHierarchicalCommandFor(folderPath) {
             const name = this.escapeShellArgument(FileSystem.basename(folderPath))
             folderPath = FileSystem.makeAbsolutePath(folderPath)
-            shellProfileString += `
+            return `
                 # 
                 # command for ${name} folder
                 # 
@@ -1247,9 +1247,17 @@ export const shellApi = Object.defineProperties(
         }
     }
 
-export const parsePackageTools = (pathToPackageTools)=>{
+export const parsePackageTools = async (pathToPackageTools)=>{
     // in the future their may be some extra logic here
     const dataStructure = yaml.parse(await FileSystem.read(pathToPackageTools), {schema: yaml.DEFAULT_SCHEMA,},)
+    const allSaveAsValues = dataStructure.map(each=>each[Object.keys(each)[0]].saveAs)
+    const illegalNames = allSaveAsValues.filter(each=>each.startsWith("_-"))
+    if (illegalNames.length > 0) {
+        throw Error(`Inside ${pathToPackageTools}, there are some illegal saveAs names (names that start with "_-")\nPlease rename these values:${illegalNames.map(each=>`\n    saveAs: ${each}`).join("")}`)
+    }
+    dataStructure.packages = dataStructure.map(each=>each["(package)"]).filter(each=>each instanceof Object)
+    dataStructure.warehouses = dataStructure.map(each=>each["(warehouse)"] || each["(defaultWarehouse)"]).filter(each=>each instanceof Object)
+    dataStructure.directPackages = dataStructure.packages.filter(each=>each.asBuildInput&&(each.load instanceof Array))
     return dataStructure
 }
 
@@ -1258,11 +1266,10 @@ export const parsePackageTools = (pathToPackageTools)=>{
 // 
 export const fornixToNix = async function(yamlString) {
     // TODO: add support for overwriting values (saveAs: python, then saveAs: python without breaking)
-    // TODO: make __core__ not be a name, just insert it everywhere using "let,in"
     const start = (new Date()).getTime()
     const dataStructure = yaml.parse(yamlString, {schema: yaml.DEFAULT_SCHEMA,},)
-    let nixCode = `
-    `
+    const allSaveAsValues = dataStructure.map(each=>each[Object.keys(each)[0]].saveAs)
+    const frequencyCountOfVarNames = allSaveAsValues.filter(each=>each).reduce((frequency, item)=>(frequency[item]?frequency[item]++:frequency[item]=1, frequency), {})
     const varNames = []
     let defaultWarehouse = null
     let defaultWarehouseName = ""
@@ -1272,17 +1279,39 @@ export const fornixToNix = async function(yamlString) {
     const nixValues = {}
     const warehouses = {}
     const packages = {}
+
+    const uniqueVarValues = Object.fromEntries(Object.entries(frequencyCountOfVarNames).filter(([eachName, eachCount])=>eachCount==1))
+    const nonUniqueVarNames = Object.entries(frequencyCountOfVarNames).filter(([eachName, eachCount])=>eachCount!=1).map((eachName, eachCount)=>eachName)
+    const nonUniqueVarValuesSoFar = {}
+    const nixVarsAtThisPoint = ()=>`\n${Object.entries(nonUniqueVarValuesSoFar).map(([eachVarName, eachNixString])=>`${eachVarName} = ${indent({ string: eachNixString, by: "    ", noLead: true })};`).join("\n")}`
+    const saveNixVar = (varName, varNixValue)=>{
+        varNames.push(varName)
+        // if its going to end up unique, store it in the uniqueVarValues
+        const storageLocation = uniqueVarValues[varName] ? uniqueVarValues : nonUniqueVarValuesSoFar
+        const varsSoFar = nixVarsAtThisPoint().trim()
+        if (varsSoFar.length == 0) {
+            storageLocation[varName] = `${indent({ string: varNixValue, by: "    ", noLead: true })}`
+        } else {
+            storageLocation[varName] = `(
+                let
+                    ${indent({ string: nixVarsAtThisPoint(), by: "                    ", noLead: true })}
+                in
+                    ${indent({ string: varNixValue, by: "                    ", noLead: true })}
+            )`.replace(/\n            /g,"\n")
+        }
+    }
     const warehouseAsNixValue = (values)=> {
         const nixCommitHash = values.createWarehouseFrom.nixCommitHash
         const tarFileUrl = values.createWarehouseFrom.tarFileUrl || `https://github.com/NixOS/nixpkgs/archive/${nixCommitHash}.tar.gz`
         const warehouseArguments = values.arguments || {}
-        return `(__core__.import
-            (__core__.fetchTarball
+        return `(_-_core.import
+            (_-_core.fetchTarball
                 ({url=${JSON.stringify(tarFileUrl)};})
             )
             (${indent({ string: escapeNixObject(warehouseArguments), by: "            ", noLead: true})})
-        )`
+        )`.replace(/\n        /g,"\n")
     }
+
     for (const eachEntry of dataStructure) {
         const kind = Object.keys(eachEntry)[0]
         // 
@@ -1319,10 +1348,8 @@ export const fornixToNix = async function(yamlString) {
             warehouses[varName].name = varName
             warehouses[varName].tarFileUrl = tarFileUrl
             warehouses[varName].arguments = warehouseArguments
-            varNames.push(varName)
-            nixCode += `
-                ${varName} = ${indent({ string: warehouseAsNixValue(values), by: "        ", noLead: true })};
-            `
+            // if is will end up being a unique name
+            saveNixVar(varName, warehouseAsNixValue(values))
             // save defaultWarehouse name
             if (kind == "(defaultWarehouse)") {
                 defaultWarehouseName = varName
@@ -1367,10 +1394,7 @@ export const fornixToNix = async function(yamlString) {
                 }
             }
             computed[varName] = resultAsValue
-            varNames.push(varName)
-            nixCode += `
-                ${varName} = (${indent({ string: escapeNixObject(resultAsValue), by: "                        ", noLead: true})});
-            `
+            saveNixVar(varName, escapeNixObject(resultAsValue))
         // 
         // (package)
         // 
@@ -1455,11 +1479,8 @@ export const fornixToNix = async function(yamlString) {
             // 
             if (values.saveAs) {
                 const varName = values.saveAs
-                varNames.push(varName)
                 packages[varName] = values
-                nixCode += `
-                ${varName} = ${nixValue};
-                `
+                saveNixVar(varName, nixValue)
             }
         // 
         // (nix)
@@ -1492,11 +1513,8 @@ export const fornixToNix = async function(yamlString) {
             // create name if needed
             // 
             const varName = values.saveAs
-            varNames.push(varName)
             nixValues[varName] = values
-            nixCode += `
-                ${varName} = ${nixValue};
-            `
+            saveNixVar(varName, nixValue)
         }
     }
     
@@ -1508,31 +1526,9 @@ export const fornixToNix = async function(yamlString) {
     let libraryPathsString = ""
     let packagePathStrings = ""
     for (const [varName, value] of Object.entries(packages)) {
-        libraryPathsString += `"${varName}" = __core__.lib.makeLibraryPath [ ${varName} ];\n`
+        libraryPathsString += `"${varName}" = _-_core.lib.makeLibraryPath [ ${varName} ];\n`
         packagePathStrings += `"${varName}" = ${varName};\n`
     }
-    let nixShellData = `
-            __nixShellEscapedJsonData__ = (
-                let 
-                    nixShellDataJson = (__core__.toJSON {
-                        libraryPaths = {\n${indent({string:libraryPathsString, by: "                            ",})}
-                        };
-                        packagePaths = {\n${indent({string:packagePathStrings, by: "                            ",})}
-                        };
-                    });
-                    bashEscapedJson = (builtins.replaceStrings
-                        [
-                            "'"
-                        ]
-                        [
-                            ${escapeNixString(`'"'"'`)}
-                        ]
-                        nixShellDataJson
-                    );
-                in
-                    bashEscapedJson
-            );
-    `
     
     return {
         defaultWarehouse,
@@ -1545,7 +1541,7 @@ export const fornixToNix = async function(yamlString) {
             #
             # create a standard library for convienience 
             # 
-            __core__ = (
+            _-_core = (
                 let
                     frozenStd = (builtins.import 
                         (builtins.fetchTarball
@@ -1566,13 +1562,40 @@ export const fornixToNix = async function(yamlString) {
                     )
             );
             
+            #
             # 
             # Packages, Vars, and Compute
-            # 
-            ${nixCode}
-            ${nixShellData}
+            #
+            #\n${Object.entries(uniqueVarValues).map(
+                ([eachVarName, eachNixString])=>
+                    `            ${eachVarName} = ${indent({ string: eachNixString, by: "            ", noLead: true })};`
+            ).join("\n")}
+            \n${indent({ string: nixVarsAtThisPoint(), by: "                ", noLead: true })}
+            #
+            # nix shell data
+            #
+                _-_nixShellEscapedJsonData = (
+                    let 
+                        nixShellDataJson = (_-_core.toJSON {
+                            libraryPaths = {\n${indent({string:libraryPathsString, by: "                            ",})}
+                            };
+                            packagePaths = {\n${indent({string:packagePathStrings, by: "                            ",})}
+                            };
+                        });
+                        bashEscapedJson = (builtins.replaceStrings
+                            [
+                                "'"
+                            ]
+                            [
+                                ${escapeNixString(`'"'"'`)}
+                            ]
+                            nixShellDataJson
+                        );
+                    in
+                        bashEscapedJson
+                );
         in
-            __core__.mkShell {
+            _-_core.mkShell {
                 # inside that shell, make sure to use these packages
                 buildInputs =  [\n${indent({
                         string:buildInputStrings.join("\n"),
@@ -1588,7 +1611,7 @@ export const fornixToNix = async function(yamlString) {
                 
                 # run some bash code before starting up the shell
                 shellHook = "
-                    export VIRKSHOP_NIX_SHELL_DATA='\${__nixShellEscapedJsonData__}'
+                    export VIRKSHOP_NIX_SHELL_DATA='\${_-_nixShellEscapedJsonData}'
                 ";
             }
         `.replace(/\n        /g,"\n"),
